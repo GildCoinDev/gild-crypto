@@ -1,14 +1,22 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
 
-contract GildToken is ERC20, Ownable, ReentrancyGuard {
-    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 10**18;
+contract GildToken is ERC20, Ownable, ReentrancyGuard, Pausable, UUPSUpgradeable, ERC165 {
+    using SafeMath for uint256;
+
+    uint256 public immutable MAX_SUPPLY = 1_000_000_000 * 10**18;
     uint256 public inflationRate = 6; // % per year
     uint256 public lastInflationTime = block.timestamp;
     uint256 public rewardRate = 12; // Base APY % for gilding stakes
+    uint256 public constant MIN_STAKE = 32 * 10**18; // Minimum stake amount
     
     mapping(address => uint256) public stakedBalances;
     mapping(address => uint256) public stakingRewards;
@@ -21,46 +29,66 @@ contract GildToken is ERC20, Ownable, ReentrancyGuard {
     event Unstaked(address indexed user, uint256 amount);
     event RewardClaimed(address indexed user, uint256 amount);
     event GoldBoostSet(address indexed user, uint256 boost);
+    event InflationMinted(uint256 amount);
+    event TokensBurned(uint256 amount);
     
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() ERC20("Gild", "GILD") {
         _mint(msg.sender, MAX_SUPPLY / 5); // 20% initial for liquidity
+        _disableInitializers(); // For upgradeability
+    }
+
+    function initialize() initializer public {
+        __Ownable_init();
+        __UUPSUpgradeable_init();
     }
     
-    // Inflation minting (governance callable)
-    function mintInflation() external onlyOwner {
+    /// @notice Mint inflation rewards, with overflow protection and burn
+    function mintInflation() external onlyOwner whenNotPaused {
         uint256 timePassed = block.timestamp - lastInflationTime;
         if (timePassed >= 365 days) {
             uint256 years = timePassed / 365 days;
-            uint256 newTokens = (totalSupply() * inflationRate * years) / 100;
-            _mint(address(this), newTokens / 2); // 50% to contract, burn rest implicitly
+            uint256 newTokens = totalSupply().mul(inflationRate).mul(years).div(100);
+            uint256 toMint = newTokens.div(2);
+            uint256 toBurn = newTokens.sub(toMint); // Explicit burn
+            _mint(address(this), toMint);
+            _burn(address(this), toBurn); // Burn the rest
             lastInflationTime = block.timestamp;
+            emit InflationMinted(toMint);
+            emit TokensBurned(toBurn);
         }
     }
     
-    // Stake function: Gild your tokens
-    function stake(uint256 amount) external nonReentrant {
-        require(amount > 0, "Amount must be positive");
+    modifier antiFrontRun() {
+        uint256 gasStart = gasleft();
+        _;
+        require(gasleft() > gasStart / 63, "Possible front-run detected");
+    }
+    
+    /// @notice Stake tokens with min check
+    function stake(uint256 amount) external nonReentrant antiFrontRun whenNotPaused {
+        require(amount >= MIN_STAKE, "Amount below minimum stake");
         _transfer(msg.sender, address(this), amount);
         updateRewards(msg.sender);
-        stakedBalances[msg.sender] += amount;
-        totalStaked += amount;
+        stakedBalances[msg.sender] = stakedBalances[msg.sender].add(amount);
+        totalStaked = totalStaked.add(amount);
         stakingTimestamps[msg.sender] = block.timestamp;
         emit Staked(msg.sender, amount);
     }
     
-    // Unstake (with unbonding simulation via delay)
-    function unstake(uint256 amount) external nonReentrant {
+    /// @notice Unstake after unbonding
+    function unstake(uint256 amount) external nonReentrant antiFrontRun whenNotPaused {
         require(amount > 0 && amount <= stakedBalances[msg.sender], "Invalid amount");
         require(block.timestamp >= stakingTimestamps[msg.sender] + 7 days, "Unbonding period");
         updateRewards(msg.sender);
-        stakedBalances[msg.sender] -= amount;
-        totalStaked -= amount;
+        stakedBalances[msg.sender] = stakedBalances[msg.sender].sub(amount);
+        totalStaked = totalStaked.sub(amount);
         _transfer(address(this), msg.sender, amount);
         emit Unstaked(msg.sender, amount);
     }
     
-    // Claim rewards: Harvest gilded yields
-    function claimRewards() external nonReentrant {
+    /// @notice Claim accumulated rewards
+    function claimRewards() external nonReentrant antiFrontRun whenNotPaused {
         updateRewards(msg.sender);
         uint256 rewards = stakingRewards[msg.sender];
         if (rewards > 0) {
@@ -70,28 +98,56 @@ contract GildToken is ERC20, Ownable, ReentrancyGuard {
         }
     }
     
-    // Internal reward update with goldBoost
+    /// @notice Internal reward calculation
     function updateRewards(address user) internal {
         uint256 timeStaked = block.timestamp - stakingTimestamps[user];
-        uint256 baseRewards = (stakedBalances[user] * rewardRate * timeStaked) / (100 * 365 days);
-        uint256 boosted = baseRewards + (baseRewards * goldBoosts[user]) / 100;
-        stakingRewards[user] += boosted;
+        uint256 baseRewards = stakedBalances[user].mul(rewardRate).mul(timeStaked).div(100 * 365 days);
+        uint256 boosted = baseRewards.add(baseRewards.mul(goldBoosts[user]).div(100));
+        stakingRewards[user] = stakingRewards[user].add(boosted);
         stakingTimestamps[user] = block.timestamp;
     }
     
-    // Set goldBoost (governance or lock function)
+    /// @notice Set boost for user
     function setGoldBoost(address user, uint256 boost) external onlyOwner {
         require(boost <= 20, "Max 20% boost");
         goldBoosts[user] = boost;
         emit GoldBoostSet(user, boost);
     }
     
-    // Governance setters
+    /// @notice Governance: Set inflation rate
     function setInflationRate(uint256 newRate) external onlyOwner {
         inflationRate = newRate;
     }
     
+    /// @notice Governance: Set reward rate
     function setRewardRate(uint256 newRate) external onlyOwner {
         rewardRate = newRate;
+    }
+    
+    /// @notice Pause contract in emergencies
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    /// @notice Unpause contract
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    /// @notice Emergency withdraw for paused state
+    function emergencyWithdraw(uint256 amount) external whenPaused {
+        require(amount <= stakedBalances[msg.sender], "Invalid amount");
+        stakedBalances[msg.sender] = stakedBalances[msg.sender].sub(amount);
+        totalStaked = totalStaked.sub(amount);
+        _transfer(address(this), msg.sender, amount);
+        emit Unstaked(msg.sender, amount);
+    }
+    
+    // UUPS upgrade authorization
+    function _authorizeUpgrade(address newImplementation) internal onlyOwner override {}
+    
+    // ERC165 support
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return super.supportsInterface(interfaceId);
     }
 }
