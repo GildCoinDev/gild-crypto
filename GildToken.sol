@@ -147,6 +147,11 @@ contract GildToken is ERC20Upgradeable, OwnableUpgradeable, ReentrancyGuardUpgra
         emit Unstaked(msg.sender, amount);
     }
     
+    /// @notice Fallback function to revert unknown calls
+    fallback() external payable {
+        revert("GildToken: Unknown function call");
+    }
+    
     // UUPS upgrade authorization
     function _authorizeUpgrade(address newImplementation) internal onlyOwner override {}
     
