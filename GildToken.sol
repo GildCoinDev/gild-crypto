@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+import "@openzeppelin/contracts-upgradeable/utils/introspection/ERC165Upgradeable.sol";
 
-contract GildToken is ERC20, Ownable, ReentrancyGuard, Pausable, UUPSUpgradeable, ERC165 {
-    using SafeMath for uint256;
+contract GildToken is ERC20Upgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, UUPSUpgradeable, ERC165Upgradeable {
+    using SafeMathUpgradeable for uint256;
 
     uint256 public immutable MAX_SUPPLY = 1_000_000_000 * 10**18;
     uint256 public inflationRate = 6; // % per year
@@ -33,22 +33,26 @@ contract GildToken is ERC20, Ownable, ReentrancyGuard, Pausable, UUPSUpgradeable
     event TokensBurned(uint256 amount);
     
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() ERC20("Gild", "GILD") {
-        _mint(msg.sender, MAX_SUPPLY / 5); // 20% initial for liquidity
+    constructor() {
         _disableInitializers(); // For upgradeability
     }
 
     function initialize() initializer public {
-        __Ownable_init();
+        __ERC20_init("Gild", "GILD");
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
         __UUPSUpgradeable_init();
+        __ERC165_init();
+        _mint(msg.sender, MAX_SUPPLY / 5); // 20% initial for liquidity
     }
     
     /// @notice Mint inflation rewards, with overflow protection and burn
     function mintInflation() external onlyOwner whenNotPaused {
         uint256 timePassed = block.timestamp - lastInflationTime;
         if (timePassed >= 365 days) {
-            uint256 years = timePassed / 365 days;
-            uint256 newTokens = totalSupply().mul(inflationRate).mul(years).div(100);
+            uint256 numYears = timePassed / (365 days);
+            uint256 newTokens = totalSupply().mul(inflationRate).mul(numYears).div(100);
             uint256 toMint = newTokens.div(2);
             uint256 toBurn = newTokens.sub(toMint); // Explicit burn
             _mint(address(this), toMint);
